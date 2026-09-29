@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "sculpt_layers_multires"
+version = "1.13.23"
+name = "Sculpt Layers for Multires"
+tagline = "Per-mesh multi-layer Multires sculpting with strength control"
+maintainer = "beni"
+type = "add-on"
+
+tags = ["Sculpt"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]

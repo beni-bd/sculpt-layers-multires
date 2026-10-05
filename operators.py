@@ -402,8 +402,29 @@ class SCULPTLAYERS_OT_add_layer(Operator):
 
         move_to_collection(new_obj, col)
 
-        if new_obj.data.shape_keys:
-            new_obj.shape_key_clear()
+        # Keep shape keys that came from Base; drop any other leftover keys
+        try:
+            inherited = set()
+            raw = base_obj.get("sculpt_layers_base_sk_names", "")
+            if raw:
+                inherited = {n for n in str(raw).split("\n") if n and n != "Basis"}
+            if not inherited and base_obj.data.shape_keys:
+                inherited = {
+                    kb.name for kb in base_obj.data.shape_keys.key_blocks
+                    if kb.name != "Basis"
+                }
+            sks = new_obj.data.shape_keys
+            if sks is not None:
+                for kb in list(sks.key_blocks):
+                    if kb.name == "Basis":
+                        continue
+                    if kb.name not in inherited:
+                        try:
+                            new_obj.shape_key_remove(kb)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
         # Offset relative to the last sculpt layer (not Base × N)
         try:

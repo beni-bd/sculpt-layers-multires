@@ -754,6 +754,59 @@ def find_item_by_object(settings, obj):
     return None
 
 
+
+def _base_has_shape_keys(obj):
+    try:
+        sks = obj.data.shape_keys
+        return sks is not None and len(sks.key_blocks) > 1
+    except Exception:
+        return False
+
+
+def _copy_shape_keys_preserving(src_obj, dst_obj):
+    """
+    Copy shape keys from src to dst when base vertex counts match.
+    Used so Shell Layer (reshape target) can keep Base shape keys when possible.
+    """
+    if src_obj is None or dst_obj is None:
+        return False
+    try:
+        src_mesh = src_obj.data
+        dst_mesh = dst_obj.data
+        sks = src_mesh.shape_keys
+        if sks is None or len(sks.key_blocks) <= 1:
+            return False
+        if len(src_mesh.vertices) != len(dst_mesh.vertices):
+            return False
+        # Clear any existing keys on destination first
+        if dst_mesh.shape_keys is not None:
+            dst_obj.shape_key_clear()
+        # Basis from current dst positions
+        dst_obj.shape_key_add(name="Basis", from_mix=False)
+        src_keys = sks.key_blocks
+        n = len(dst_mesh.vertices)
+        for kb in src_keys:
+            if kb.name == "Basis":
+                continue
+            new_kb = dst_obj.shape_key_add(name=kb.name, from_mix=False)
+            try:
+                coords = [0.0] * (n * 3)
+                kb.data.foreach_get("co", coords)
+                new_kb.data.foreach_set("co", coords)
+            except Exception:
+                pass
+            try:
+                new_kb.value = float(kb.value)
+                new_kb.slider_min = float(kb.slider_min)
+                new_kb.slider_max = float(kb.slider_max)
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        print(f"Sculpt Layers: copy shape keys failed: {e}")
+        return False
+
+
 def ensure_basis_shape_key(obj):
     if obj.data.shape_keys is None:
         obj.shape_key_add(name="Basis", from_mix=False)
@@ -1047,6 +1100,9 @@ def create_layer00_from_base(base_obj, settings, col, target_level=None):
         except Exception:
             pass
 
+    # Layer_00 (template) must KEEP Base shape keys so L01/L02 inherit them
+    _store_base_sk_names(base_obj)
+
     bpy.ops.object.select_all(action='DESELECT')
     base_obj.hide_set(False)
     base_obj.hide_viewport = False
@@ -1076,8 +1132,9 @@ def create_layer00_from_base(base_obj, settings, col, target_level=None):
     if real > 0:
         settings.base_multires_level = real
 
-    if shell.data.shape_keys:
-        shell.shape_key_clear()
+    # Keep Base shape keys on Layer_00 (do not clear). Re-copy if lost.
+    if _base_has_shape_keys(base_obj) and not _base_has_shape_keys(shell):
+        _copy_shape_keys_preserving(base_obj, shell)
 
     shell.matrix_world = base_obj.matrix_world.copy()
     move_to_collection(shell, col)
@@ -1106,7 +1163,7 @@ def _multires_highest_level(mod):
 
 
 def _strip_to_vertices_only(obj):
-    """Remove faces and edges; keep vertices only (coordinates preserved)."""
+    """Remove faces and edges; keep vertices only (coordinates + shape keys preserved)."""
     if obj is None or obj.type != 'MESH':
         return
     mesh = obj.data
@@ -1117,6 +1174,26 @@ def _strip_to_vertices_only(obj):
         return
     if len(mesh.polygons) == 0 and len(mesh.edges) == 0:
         return
+    # Snapshot shape keys (clear_geometry destroys them)
+    sk_backup = []
+    try:
+        sks = mesh.shape_keys
+        if sks is not None:
+            for kb in sks.key_blocks:
+                coords = [0.0] * (n * 3)
+                try:
+                    kb.data.foreach_get("co", coords)
+                except Exception:
+                    continue
+                sk_backup.append((
+                    kb.name,
+                    coords,
+                    float(getattr(kb, "value", 0.0)),
+                    float(getattr(kb, "slider_min", 0.0)),
+                    float(getattr(kb, "slider_max", 1.0)),
+                ))
+    except Exception:
+        sk_backup = []
     try:
         flat = [0.0] * (n * 3)
         mesh.vertices.foreach_get("co", flat)
@@ -1124,6 +1201,23 @@ def _strip_to_vertices_only(obj):
         mesh.clear_geometry()
         mesh.from_pydata(verts, [], [])
         mesh.update()
+        # Restore shape keys on the verts-only mesh
+        if sk_backup:
+            if obj.data.shape_keys is not None:
+                obj.shape_key_clear()
+            for name, coords, value, smin, smax in sk_backup:
+                kb = obj.shape_key_add(name=name, from_mix=False)
+                try:
+                    kb.data.foreach_set("co", coords)
+                except Exception:
+                    pass
+                if name != "Basis":
+                    try:
+                        kb.slider_min = smin
+                        kb.slider_max = smax
+                        kb.value = value
+                    except Exception:
+                        pass
     except Exception as e:
         print(f"Sculpt Layers: strip Shell Layer to verts failed: {e}")
 
@@ -1207,71 +1301,80 @@ def create_shell_layer_from_base(base_obj, settings, col):
         base_mod = get_multires(base_obj)
         target = _multires_highest_level(base_mod) if base_mod else 0
 
+        # Remember which shape keys came from Base (Apply mutes only these)
+        _store_base_sk_names(base_obj)
+
         layer0 = None
-        baked = _bake_shell_layer_mesh_from_base(base_obj, target)
-        if baked is not None and len(baked.vertices) > 0:
-            l0_name = shell_layer_name_for_base(base_obj)
-            baked.name = l0_name + "_mesh"
-            layer0 = bpy.data.objects.new(l0_name, baked)
-            layer0.matrix_world = base_obj.matrix_world.copy()
-            try:
-                bpy.context.scene.collection.objects.link(layer0)
-            except Exception:
-                pass
-            mark_layer_owner(layer0, base_obj)
-            _strip_to_vertices_only(layer0)
-            if len(layer0.data.vertices) == 0:
-                try:
-                    bpy.data.objects.remove(layer0, do_unlink=True)
-                except Exception:
-                    pass
-                layer0 = None
 
-        if layer0 is None:
-            # Fallback: viewport 0 → duplicate → restore Base → Multires apply
-            base_level_snap = _snapshot_multires_levels([base_obj])
-            if base_mod is not None:
+        # Shell Layer (reshape target) must NOT carry Base shape keys.
+        # Mute them while evaluating/baking so geometry is at Basis.
+        base_sk_snap = _mute_shape_keys(base_obj)
+        try:
+            baked = _bake_shell_layer_mesh_from_base(base_obj, target)
+            if baked is not None and len(baked.vertices) > 0:
+                l0_name = shell_layer_name_for_base(base_obj)
+                baked.name = l0_name + "_mesh"
+                layer0 = bpy.data.objects.new(l0_name, baked)
+                layer0.matrix_world = base_obj.matrix_world.copy()
                 try:
-                    base_mod.levels = 0
+                    bpy.context.scene.collection.objects.link(layer0)
                 except Exception:
                     pass
-            bpy.ops.object.select_all(action='DESELECT')
-            base_obj.hide_set(False)
-            base_obj.hide_viewport = False
-            base_obj.hide_select = False
-            base_obj.select_set(True)
-            bpy.context.view_layer.objects.active = base_obj
-            bpy.ops.object.duplicate(linked=False)
-            _restore_multires_levels(base_level_snap)
-            layer0 = bpy.context.active_object
-            layer0.name = shell_layer_name_for_base(base_obj)
-            mark_layer_owner(layer0, base_obj)
-            layer0.matrix_world = base_obj.matrix_world.copy()
-            layer0_mod = ensure_multires(layer0)
-            if base_mod and target > 0:
-                while _multires_highest_level(layer0_mod) < target:
+                mark_layer_owner(layer0, base_obj)
+                _strip_to_vertices_only(layer0)
+                if len(layer0.data.vertices) == 0:
                     try:
-                        bpy.ops.object.multires_subdivide(modifier=layer0_mod.name)
+                        bpy.data.objects.remove(layer0, do_unlink=True)
                     except Exception:
-                        break
-                    layer0_mod = get_multires(layer0)
-                    if layer0_mod is None:
-                        break
-                if layer0_mod:
-                    layer0_mod.levels = target
-                    layer0_mod.sculpt_levels = target
-                    layer0_mod.render_levels = target
-            layer0_mod = get_multires(layer0)
-            if layer0_mod:
-                try:
-                    bpy.ops.object.modifier_apply(modifier=layer0_mod.name)
-                except Exception as e:
-                    print(f"Sculpt Layers: could not apply Multires on Shell Layer: {e}")
-            if layer0.data.shape_keys:
-                layer0.shape_key_clear()
-            _strip_to_vertices_only(layer0)
+                        pass
+                    layer0 = None
 
-        if layer0.data.shape_keys:
+            if layer0 is None:
+                # Fallback: duplicate while Base SKs muted → apply Multires → clear any SKs
+                base_level_snap = _snapshot_multires_levels([base_obj])
+                if base_mod is not None:
+                    try:
+                        base_mod.levels = 0
+                    except Exception:
+                        pass
+                bpy.ops.object.select_all(action='DESELECT')
+                base_obj.hide_set(False)
+                base_obj.hide_viewport = False
+                base_obj.hide_select = False
+                base_obj.select_set(True)
+                bpy.context.view_layer.objects.active = base_obj
+                bpy.ops.object.duplicate(linked=False)
+                _restore_multires_levels(base_level_snap)
+                layer0 = bpy.context.active_object
+                layer0.name = shell_layer_name_for_base(base_obj)
+                mark_layer_owner(layer0, base_obj)
+                layer0.matrix_world = base_obj.matrix_world.copy()
+                layer0_mod = ensure_multires(layer0)
+                if base_mod and target > 0:
+                    while _multires_highest_level(layer0_mod) < target:
+                        try:
+                            bpy.ops.object.multires_subdivide(modifier=layer0_mod.name)
+                        except Exception:
+                            break
+                        layer0_mod = get_multires(layer0)
+                        if layer0_mod is None:
+                            break
+                    if layer0_mod:
+                        layer0_mod.levels = target
+                        layer0_mod.sculpt_levels = target
+                        layer0_mod.render_levels = target
+                layer0_mod = get_multires(layer0)
+                if layer0_mod:
+                    try:
+                        bpy.ops.object.modifier_apply(modifier=layer0_mod.name)
+                    except Exception as e:
+                        print(f"Sculpt Layers: could not apply Multires on Shell Layer: {e}")
+                _strip_to_vertices_only(layer0)
+        finally:
+            _restore_shape_keys(base_obj, base_sk_snap)
+
+        # Shell Layer must never keep shape keys
+        if layer0 is not None and layer0.data.shape_keys:
             layer0.shape_key_clear()
 
         layer0.matrix_world = base_obj.matrix_world.copy()
@@ -2140,6 +2243,12 @@ def _join_shapes_layer_to_shell_layer(context, layer_obj, layer0, strength):
     was_l_vp = layer_obj.hide_viewport
     was_l_h = layer_obj.hide_get()
 
+    # Mute ONLY shape keys that originally came from Base (not all keys)
+    inherited = _stored_base_sk_names(base if base is not None else None)
+    if not inherited and base is not None:
+        inherited = _base_shape_key_names(base)
+    layer_sk_snap = _mute_shape_keys(layer_obj, only_names=list(inherited))
+
     try:
         _make_selectable(layer0, context)
         _make_selectable(layer_obj, context)
@@ -2212,6 +2321,7 @@ def _join_shapes_layer_to_shell_layer(context, layer_obj, layer0, strength):
         except Exception:
             pass
         _restore_multires_levels(_level_snap)
+        _restore_shape_keys(layer_obj, layer_sk_snap)
 
 
 
@@ -2253,20 +2363,67 @@ def _restore_non_multires_modifiers(obj, saved):
         except Exception:
             pass
 
-def _mute_shape_keys(obj):
-    """Set all shape-key values to 0; return list of (name, value) to restore."""
+def _base_shape_key_names(obj):
+    """Non-Basis shape key names currently on obj."""
+    names = []
+    try:
+        sks = obj.data.shape_keys
+        if sks is None:
+            return names
+        for kb in sks.key_blocks:
+            if kb.name != "Basis":
+                names.append(kb.name)
+    except Exception:
+        pass
+    return names
+
+
+def _stored_base_sk_names(base_obj):
+    """Shape-key names that were on Base when layers were first created."""
+    if base_obj is None:
+        return []
+    try:
+        raw = base_obj.get("sculpt_layers_base_sk_names", "")
+        if not raw:
+            return []
+        return [n for n in str(raw).split("\n") if n and n != "Basis"]
+    except Exception:
+        return []
+
+
+def _store_base_sk_names(base_obj):
+    """Record Base shape-key names so Apply can mute only those later."""
+    if base_obj is None:
+        return
+    try:
+        names = _base_shape_key_names(base_obj)
+        base_obj["sculpt_layers_base_sk_names"] = "\n".join(names)
+    except Exception:
+        pass
+
+
+def _mute_shape_keys(obj, only_names=None):
+    """
+    Set shape-key values to 0; return list of (name, value) to restore.
+
+    only_names: if provided, mute ONLY those keys (plus never touches others).
+                Used so only shape keys that came from Base are muted on Apply.
+    """
     if obj is None or getattr(obj, "data", None) is None:
         return []
     sks = obj.data.shape_keys
     if sks is None:
         return []
     saved = []
+    only = set(only_names) if only_names is not None else None
     for kb in sks.key_blocks:
-        # Skip Basis (index 0) value is typically unused, but still save all
+        if kb.name == "Basis":
+            continue
+        if only is not None and kb.name not in only:
+            continue
         try:
             saved.append((kb.name, float(kb.value)))
-            if kb.name != "Basis":
-                kb.value = 0.0
+            kb.value = 0.0
         except Exception:
             pass
     return saved
@@ -2310,8 +2467,13 @@ def _reshape_base_from_shell_layer(context, base, layer0, multires_mod):
     was_l0_vp = layer0.hide_viewport
     was_l0_h = layer0.hide_get()
 
-    # Base shape keys + non-Multires modifiers off during Reshape, then restored
-    base_sk_snap = _mute_shape_keys(base)
+    # Mute ONLY Base-originated shape keys (not every key on Base)
+    inherited = _stored_base_sk_names(base)
+    if not inherited:
+        inherited = _base_shape_key_names(base)
+    base_sk_snap = _mute_shape_keys(base, only_names=list(inherited))
+    # Same inherited keys on Layer 0 if present
+    layer0_sk_snap = _mute_shape_keys(layer0, only_names=list(inherited))
     base_mod_snap = _mute_non_multires_modifiers(base)
 
     try:
@@ -2350,5 +2512,6 @@ def _reshape_base_from_shell_layer(context, base, layer0, multires_mod):
             pass
         _restore_multires_levels(_level_snap)
         _restore_shape_keys(base, base_sk_snap)
+        _restore_shape_keys(layer0, layer0_sk_snap)
         _restore_non_multires_modifiers(base, base_mod_snap)
 

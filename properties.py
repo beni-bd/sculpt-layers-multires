@@ -35,14 +35,14 @@ class SculptLayerItem(PropertyGroup):
     )
     strength: FloatProperty(
         name="Strength",
-        description="Shape-key influence on Layer_00 (-1 to 1). "
+        description="Shape-key influence on Shell Layer (-5 to 5). "
                     "Change this value, then click Apply Layer / Apply Selected "
                     "to replace the shape key and update the Base.",
         default=1.0,
-        min=-1.0,
-        max=1.0,
-        soft_min=-1.0,
-        soft_max=1.0,
+        min=-5.0,
+        max=5.0,
+        soft_min=-5.0,
+        soft_max=5.0,
     )
 
 

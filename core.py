@@ -2302,8 +2302,8 @@ def _join_shapes_layer_to_shell_layer(context, layer_obj, layer0, strength):
                 layer0.shape_key_remove(keys.key_blocks[name])
 
         sk = layer0.data.shape_keys.key_blocks[sk_name]
-        sk.slider_min = -1.0
-        sk.slider_max = 1.0
+        sk.slider_min = -5.0
+        sk.slider_max = 5.0
         sk.value = float(strength)
     finally:
         # Keep Layer_00 locked to Base; restore hide state

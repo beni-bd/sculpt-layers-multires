@@ -111,12 +111,31 @@ class SCULPTLAYERS_PT_panel(Panel):
             row = box.row()
             row.enabled = False
             row.operator("sculptlayers.setup_base", icon='PINNED', text="Set as Base (blocked)")
+            row = box.row()
+            row.enabled = False
+            row.operator(
+                "sculptlayers.convert_to_layer",
+                icon='MOD_DISPLACE',
+                text="Convert to Layer",
+            )
         elif active_is_base or has_base:
             row = box.row()
             row.enabled = False
             row.operator("sculptlayers.setup_base", icon='PINNED', text="Set as Base")
+            row = box.row()
+            row.enabled = False
+            row.operator(
+                "sculptlayers.convert_to_layer",
+                icon='MOD_DISPLACE',
+                text="Convert to Layer",
+            )
         else:
             box.operator("sculptlayers.setup_base", icon='PINNED', text="Set as Base")
+            box.operator(
+                "sculptlayers.convert_to_layer",
+                icon='MOD_DISPLACE',
+                text="Convert to Layer",
+            )
 
         if has_base:
             has_any_layer = any(not i.is_base for i in settings.layers)

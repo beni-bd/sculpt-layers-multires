@@ -43,7 +43,8 @@ from .core import (
     _set_multires_levels,
     _snapshot_multires_levels,
     _sync_shell_layer_from_list,
-    _zero_and_swap_layer_locations,
+    _zero_and_swap_layer_locations,    _erase_multires_displacement,
+    _focus_view_on_object,
 )
 
 class SCULPTLAYERS_OT_setup_base(Operator):
@@ -146,6 +147,174 @@ class SCULPTLAYERS_OT_setup_base(Operator):
         )
         return {'FINISHED'}
 
+
+
+
+class SCULPTLAYERS_OT_convert_to_layer(Operator):
+    """For Mesh That Already has Displacement"""
+    bl_idname = "sculptlayers.convert_to_layer"
+    bl_label = "Convert to Layer"
+    bl_description = "For Mesh That Already has Displacement"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = get_active_mesh(context)
+        if obj is None:
+            return False
+        if is_registered_base(obj):
+            return False
+        if is_sculpt_layer_object(obj):
+            return False
+        return True
+
+    def execute(self, context):
+        obj = get_active_mesh(context)
+        if not obj:
+            self.report({'ERROR'}, "Select a mesh object first")
+            return {'CANCELLED'}
+        if is_registered_base(obj) or is_sculpt_layer_object(obj):
+            self.report({'ERROR'}, "Select a normal mesh (not a Base or sculpt layer).")
+            return {'CANCELLED'}
+        if object_in_sculpt_layers_collection(obj):
+            self.report({'ERROR'}, f"'{obj.name}' is already in \"{COLLECTION_NAME}\".")
+            return {'CANCELLED'}
+
+        settings = get_object_settings(obj)
+        if settings is None:
+            self.report({'ERROR'}, "Object has no sculpt_layers property")
+            return {'CANCELLED'}
+
+        core._is_updating = True
+        try:
+            if context.mode != 'OBJECT':
+                try:
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                except Exception:
+                    pass
+
+            ensure_multires(obj)
+            base_mod = get_multires(obj)
+            highest = _multires_highest_level(base_mod) if base_mod else 0
+            base_vp = int(base_mod.levels) if base_mod else highest
+
+            # 1) Duplicate current displaced mesh → will become first sculpt layer
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.hide_set(False)
+            obj.hide_viewport = False
+            obj.hide_select = False
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+            bpy.ops.object.duplicate(linked=False)
+            displaced = context.active_object
+            displaced.name = f"{obj.name}_L01"
+
+            # 2) Clean original → Base with no deformation (fastest path)
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+            erased = _erase_multires_displacement(obj)
+            if not erased:
+                self.report(
+                    {'WARNING'},
+                    "Could not fully erase displacement; Base may still have sculpt data.",
+                )
+
+            # Restore Multires levels on Base after erase
+            base_mod = get_multires(obj)
+            if base_mod is None:
+                base_mod = ensure_multires(obj)
+            if base_mod and highest > 0:
+                _set_multires_levels(base_mod, highest, base_viewport=min(MULTIRES_VIEWPORT_MAX, base_vp or highest))
+
+            # 3) Set as Base (clean list)
+            for item in list(settings.layers):
+                if item.is_shell_layer and item.object and _object_alive(item.object):
+                    try:
+                        bpy.data.objects.remove(item.object, do_unlink=True)
+                    except Exception:
+                        pass
+                elif not item.is_base and item.object and _object_alive(item.object):
+                    if item.object != displaced:
+                        try:
+                            bpy.data.objects.remove(item.object, do_unlink=True)
+                        except Exception:
+                            pass
+            _delete_shell_layer_for_base(obj)
+            _delete_layer00_for_base(obj)
+            settings.layers.clear()
+
+            base_item = settings.layers.add()
+            base_item.name = "Base"
+            base_item.object = obj
+            base_item.is_base = True
+            base_item.is_shell_layer = False
+            base_item.is_layer00 = False
+            base_item.is_selected = False
+            base_item.strength = 1.0
+
+            settings.base_vertex_count = len(obj.data.vertices)
+            settings.base_multires_level = highest
+            settings.offset_distance = _default_offset_distance(obj)
+            mark_as_base(obj)
+
+            col = get_or_create_collection()
+
+            # 4) Shell Layer + Layer_00 from clean Base
+            create_shell_layer_from_base(obj, settings, col)
+            create_layer00_from_base(obj, settings, col, highest)
+
+            # 5) Register displaced duplicate as first sculpt layer
+            mark_layer_owner(displaced, obj)
+            try:
+                if "sculpt_layers_is_layer00" in displaced:
+                    del displaced["sculpt_layers_is_layer00"]
+            except Exception:
+                pass
+            layer_mod = get_multires(displaced)
+            if layer_mod and highest > 0:
+                _set_multires_levels(
+                    layer_mod, highest,
+                    base_viewport=min(MULTIRES_VIEWPORT_MAX, base_vp or highest),
+                )
+            move_to_collection(displaced, col)
+            try:
+                dist = float(settings.offset_distance)
+                displaced.location.x += dist
+            except Exception:
+                pass
+
+            item = settings.layers.add()
+            item.name = displaced.name
+            item.object = displaced
+            item.is_base = False
+            item.is_shell_layer = False
+            item.is_layer00 = False
+            item.is_selected = True
+            item.strength = 1.0
+
+            pin_system_layers_in_list(settings)
+            settings.active_index = len(settings.layers) - 1
+
+            try:
+                bpy.ops.object.select_all(action='DESELECT')
+                displaced.hide_viewport = False
+                displaced.hide_set(False)
+                displaced.hide_select = False
+                displaced.select_set(True)
+                context.view_layer.objects.active = displaced
+            except Exception:
+                pass
+            _focus_view_on_object(context, displaced)
+        finally:
+            core._is_updating = False
+
+        self.report(
+            {'INFO'},
+            f"Converted '{obj.name}' → clean Base + layer '{displaced.name}' "
+            f"(kept existing displacement on the layer).",
+        )
+        return {'FINISHED'}
 
 
 class SCULPTLAYERS_OT_subdivide_base(Operator):
@@ -482,6 +651,9 @@ class SCULPTLAYERS_OT_add_layer(Operator):
             context.view_layer.objects.active = new_obj
         except Exception:
             pass
+
+        # Focus viewport on new layer (same as numpad '.')
+        _focus_view_on_object(context, new_obj)
 
         if getattr(settings, "auto_sculpt_mode", False):
             try:

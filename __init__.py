@@ -2,7 +2,7 @@
 bl_info = {
     "name": "Sculpt Layers for Multires",
     "author": "beni",
-    "version": (1, 13, 28),
+    "version": (1, 13, 31),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Sculpt Layers",
     "description": "Sculpt Layers for Multires — per-mesh multi-layer Multires sculpting",
@@ -15,6 +15,7 @@ from bpy.props import PointerProperty
 from .properties import SculptLayerItem, SculptLayersSettings
 from .operators import (
     SCULPTLAYERS_OT_setup_base,
+    SCULPTLAYERS_OT_convert_to_layer,
     SCULPTLAYERS_OT_subdivide_base,
     SCULPTLAYERS_OT_unsubdivide_base,
     SCULPTLAYERS_OT_add_layer,
@@ -44,6 +45,7 @@ classes = (
     SculptLayerItem,
     SculptLayersSettings,
     SCULPTLAYERS_OT_setup_base,
+    SCULPTLAYERS_OT_convert_to_layer,
     SCULPTLAYERS_OT_subdivide_base,
     SCULPTLAYERS_OT_unsubdivide_base,
     SCULPTLAYERS_OT_add_layer,

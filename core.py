@@ -1065,6 +1065,184 @@ def _delete_layer00_for_base(base_obj):
             pass
 
 
+
+def _erase_multires_displacement(obj):
+    """
+    Remove Multires sculpt displacement from obj, keep subdivision levels.
+    Prefers Sculpt mesh-filter ERASE_DISPLACEMENT; falls back to rebuild subdiv.
+    """
+    if obj is None or obj.type != 'MESH':
+        return False
+    mod = get_multires(obj)
+    if mod is None:
+        return False
+    highest = _multires_highest_level(mod)
+    ctx = bpy.context
+    # Ensure selectable + active
+    try:
+        if ctx.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+    except Exception:
+        pass
+    try:
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.hide_set(False)
+        obj.hide_viewport = False
+        obj.hide_select = False
+        obj.select_set(True)
+        ctx.view_layer.objects.active = obj
+    except Exception:
+        pass
+
+    # Path 1: Sculpt Mode erase displacement filter (usually fastest)
+    try:
+        bpy.ops.object.mode_set(mode='SCULPT')
+        # Flood erase across whole mesh
+        try:
+            bpy.ops.sculpt.mesh_filter(
+                type='ERASE_DISPLACEMENT',
+                strength=1.0,
+                deform_axis={'X', 'Y', 'Z'},
+            )
+        except TypeError:
+            # Older API without deform_axis
+            bpy.ops.sculpt.mesh_filter(type='ERASE_DISPLACEMENT', strength=1.0)
+        bpy.ops.object.mode_set(mode='OBJECT')
+        return True
+    except Exception as e:
+        print(f"Sculpt Layers: erase displacement filter failed ({e}); trying rebuild")
+        try:
+            if ctx.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+
+    # Path 2: rebuild subdivisions from current base (clears higher-level displacement)
+    try:
+        bpy.ops.object.multires_rebuild_subdiv(modifier=mod.name)
+        return True
+    except Exception as e:
+        print(f"Sculpt Layers: multires_rebuild_subdiv failed ({e})")
+
+    # Path 3: last resort — apply at level 0 and re-subdivide
+    try:
+        mod = get_multires(obj)
+        if mod is None:
+            return False
+        try:
+            mod.levels = 0
+            mod.sculpt_levels = 0
+        except Exception:
+            pass
+        # Apply removes displacement by collapsing to current base
+        # Instead: delete higher levels if API exists
+        try:
+            while _multires_highest_level(mod) > 0:
+                bpy.ops.object.multires_unsubdivide(modifier=mod.name)
+                mod = get_multires(obj)
+                if mod is None:
+                    break
+        except Exception:
+            pass
+        mod = ensure_multires(obj)
+        for _ in range(int(highest)):
+            try:
+                bpy.ops.object.multires_subdivide(modifier=mod.name)
+            except Exception:
+                break
+            mod = get_multires(obj)
+            if mod is None:
+                break
+        if mod and highest > 0:
+            _set_multires_levels(mod, highest, base_viewport=min(3, highest))
+        return True
+    except Exception as e:
+        print(f"Sculpt Layers: displacement erase fallback failed: {e}")
+        return False
+
+
+_pending_focus_name = None
+
+
+def _focus_view_on_object(context, obj):
+    """
+    Frame viewport on obj with Smooth View (numpad '.').
+
+    Selection is applied immediately; view_selected is deferred to the next
+    timer tick so it runs outside the operator stack — same path as a real
+    keypress, which is what makes Smooth View animate properly.
+    """
+    global _pending_focus_name
+    if obj is None:
+        return
+    try:
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.hide_set(False)
+        obj.hide_viewport = False
+        obj.hide_select = False
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+    except Exception:
+        pass
+
+    _pending_focus_name = obj.name
+
+    def _deferred_view_selected():
+        global _pending_focus_name
+        name = _pending_focus_name
+        _pending_focus_name = None
+        if not name:
+            return None
+        target = bpy.data.objects.get(name)
+        if target is None:
+            return None
+        try:
+            # Re-assert selection (another handler may have changed it)
+            for o in list(bpy.context.view_layer.objects):
+                try:
+                    o.select_set(o == target)
+                except Exception:
+                    pass
+            bpy.context.view_layer.objects.active = target
+        except Exception:
+            pass
+
+        # Prefer a real VIEW_3D region so Smooth View has a valid region
+        try:
+            for window in bpy.context.window_manager.windows:
+                screen = window.screen
+                for area in screen.areas:
+                    if area.type != 'VIEW_3D':
+                        continue
+                    for region in area.regions:
+                        if region.type != 'WINDOW':
+                            continue
+                        with bpy.context.temp_override(
+                            window=window, area=area, region=region
+                        ):
+                            bpy.ops.view3d.view_selected(
+                                'INVOKE_DEFAULT', use_all_regions=False
+                            )
+                        return None
+        except Exception:
+            pass
+        try:
+            bpy.ops.view3d.view_selected('INVOKE_DEFAULT', use_all_regions=False)
+        except Exception:
+            pass
+        return None
+
+    try:
+        # Small delay so Add Layer finishes redraw first
+        bpy.app.timers.register(_deferred_view_selected, first_interval=0.01)
+    except Exception:
+        # Fallback: call immediately if timers unavailable
+        try:
+            _deferred_view_selected()
+        except Exception:
+            pass
+
+
 def create_layer00_from_base(base_obj, settings, col, target_level=None):
     """
     Create Layer Shell on first Add Layer by plain-duplicating Base Multires.
@@ -1132,9 +1310,17 @@ def create_layer00_from_base(base_obj, settings, col, target_level=None):
     if real > 0:
         settings.base_multires_level = real
 
-    # Keep Base shape keys on Layer_00 (do not clear). Re-copy if lost.
+    # Keep Base shape keys on Layer_00, but turn them OFF (value 0)
     if _base_has_shape_keys(base_obj) and not _base_has_shape_keys(shell):
         _copy_shape_keys_preserving(base_obj, shell)
+    try:
+        sks = shell.data.shape_keys
+        if sks is not None:
+            for kb in sks.key_blocks:
+                if kb.name != "Basis":
+                    kb.value = 0.0
+    except Exception:
+        pass
 
     shell.matrix_world = base_obj.matrix_world.copy()
     move_to_collection(shell, col)
@@ -1306,8 +1492,8 @@ def create_shell_layer_from_base(base_obj, settings, col):
 
         layer0 = None
 
-        # Shell Layer (reshape target) must NOT carry Base shape keys.
-        # Mute them while evaluating/baking so geometry is at Basis.
+        # Shell Layer: remove shape keys before / never keep them.
+        # Mute Base SKs while baking so evaluated mesh is at Basis.
         base_sk_snap = _mute_shape_keys(base_obj)
         try:
             baked = _bake_shell_layer_mesh_from_base(base_obj, target)

@@ -2418,9 +2418,14 @@ def _join_shapes_layer_to_shell_layer(context, layer_obj, layer0, strength):
 
     ensure_basis_shape_key(layer0)
     sk_name = layer_obj.name
-    delete_shape_key_by_name(layer0, sk_name)
+    # Re-apply: update existing key (Update from Objects).
+    # First apply: create new key (New from Objects / join_shapes).
+    keys_before = layer0.data.shape_keys
+    sk_exists = bool(
+        keys_before is not None and keys_before.key_blocks.get(sk_name) is not None
+    )
 
-    # Pin Layer_00 to Base transform before join_shapes
+    # Pin Shell Layer to Base transform before shape transfer
     if base is not None and base != layer0:
         layer0.matrix_world = base.matrix_world.copy()
 
@@ -2452,33 +2457,54 @@ def _join_shapes_layer_to_shell_layer(context, layer_obj, layer0, strength):
 
         if not layer_obj.select_get() or not layer0.select_get():
             raise RuntimeError(
-                f"Could not select '{layer_obj.name}' and 'Shell Layer' for join_shapes "
+                f"Could not select '{layer_obj.name}' and 'Shell Layer' for shape transfer "
                 "(check they aren't excluded from the view layer)."
             )
         if context.view_layer.objects.active != layer0:
-            raise RuntimeError("Shell Layer did not become the active object for join_shapes.")
+            raise RuntimeError("Shell Layer did not become the active object for shape transfer.")
 
         override = _get_view3d_override(context)
-        if override:
-            with context.temp_override(**override):
-                bpy.ops.object.join_shapes()
+
+        def _run_shape_op(op_name):
+            op = getattr(bpy.ops.object, op_name)
+            if override:
+                with context.temp_override(**override):
+                    op()
+            else:
+                op()
+
+        if sk_exists:
+            # Update from Objects — no duplicate key, no delete needed
+            try:
+                _run_shape_op("update_shapes")
+            except Exception as e:
+                # Older Blender without update_shapes: fall back to join_shapes
+                # after deleting the old key
+                print(f"Sculpt Layers: update_shapes failed ({e}); falling back to join_shapes")
+                delete_shape_key_by_name(layer0, sk_name)
+                ensure_basis_shape_key(layer0)
+                _run_shape_op("join_shapes")
         else:
-            bpy.ops.object.join_shapes()
+            # New from Objects
+            _run_shape_op("join_shapes")
 
         keys = layer0.data.shape_keys
         if keys is None:
-            raise RuntimeError(f"join_shapes created no shape key for '{sk_name}'")
+            raise RuntimeError(f"Shape transfer created no shape key for '{sk_name}'")
 
         sk = keys.key_blocks.get(sk_name)
         if sk is None:
+            # join_shapes may name the new key after the source object already,
+            # or leave a generic name — pick the last non-Basis key and rename
             for kb in reversed(list(keys.key_blocks)):
                 if kb.name != "Basis":
                     sk = kb
                     sk.name = sk_name
                     break
         if sk is None:
-            raise RuntimeError(f"Shape key for '{sk_name}' not found after join_shapes")
+            raise RuntimeError(f"Shape key for '{sk_name}' not found after shape transfer")
 
+        # Only clean .001 leftovers from join_shapes path (update should not create them)
         leftovers = [
             kb.name for kb in keys.key_blocks
             if kb.name.startswith(sk_name + ".") and kb.name[len(sk_name) + 1:].isdigit()

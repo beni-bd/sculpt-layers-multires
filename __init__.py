@@ -2,7 +2,7 @@
 bl_info = {
     "name": "Sculpt Layers for Multires",
     "author": "beni",
-    "version": (1, 13, 31),
+    "version": (1, 13, 32),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Sculpt Layers",
     "description": "Sculpt Layers for Multires — per-mesh multi-layer Multires sculpting",
